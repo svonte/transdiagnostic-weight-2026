@@ -39,6 +39,12 @@ DATA = ROOT / "data"
 CLASS_REF = "antidepressant"          # lowest-risk reference
 CLASS_ORDER = ["antidepressant", "mood_stabilizer", "antipsychotic"]
 STUDY_ORDER = ["COMED", "STEP", "LiTMUS", "CATIE", "ACLAIMS"]
+# PRIMARY-ANALYSIS COHORT (Reviewer 2, major comment 2): the primary cumulative
+# ≥7% analysis is restricted to participants with ≥1 post-baseline weight
+# (n_weight_obs>=2, i.e. the outcome was actually observed). Baseline-only
+# participants cannot be classified as non-events and are moved to a sensitivity
+# analysis (Table S12). "analyzable" == has ≥1 post-baseline measurement.
+PRIMARY_REQUIRE_POSTBASELINE = True
 LANDMARK_MONTH = 3.0
 LANDMARK_WINDOW = (1.5, 4.5)
 CSG = 7.0
@@ -62,9 +68,14 @@ def load():
 # 1. Descriptives (Table 1 source)
 # ---------------------------------------------------------------------------
 def descriptives(base):
+    # ≥7% event rates and gain metrics are computed among participants with ≥1
+    # post-baseline weight (the "analyzable" cohort), i.e. those for whom the
+    # outcome was actually observed (Reviewer 2, major comment 2). Demographics,
+    # randomized N, and n≥2obs are reported for all randomized participants.
     rows = []
     for s in STUDY_ORDER:
         b = base[base["study"] == s]
+        ba = b[b["analyzable"]]                      # observed for incident gain
         rows.append(dict(
             study=s, drug_class=b["drug_class"].iloc[0], diagnosis=b["diagnosis"].iloc[0],
             formulation=b["formulation"].iloc[0],
@@ -74,22 +85,24 @@ def descriptives(base):
             baseline_wt_kg_mean=b["baseline_weight_kg"].mean(),
             baseline_wt_kg_sd=b["baseline_weight_kg"].std(),
             median_followup_mo=b["max_followup_months"].median(),
-            csg7_ever_n=int(b["ever_csg7"].sum()),
-            csg7_ever_pct=b["ever_csg7"].mean() * 100,
-            mean_max_pct_gain=b["max_pct_gain"].mean(),
-            mean_last_pct_change=b["last_pct_change"].mean(),
+            csg7_ever_n=int(ba["ever_csg7"].sum()),
+            csg7_ever_pct=ba["ever_csg7"].mean() * 100,       # analyzable denominator
+            mean_max_pct_gain=ba["max_pct_gain"].mean(),
+            mean_last_pct_change=ba["last_pct_change"].mean(),
         ))
     desc = pd.DataFrame(rows)
-    # by-class rollup
+    # by-class rollup (≥7% among the analyzable cohort)
     crows = []
     for c in CLASS_ORDER:
         b = base[base["drug_class"] == c]
+        ba = b[b["analyzable"]]
         crows.append(dict(
             drug_class=c, N=len(b), n_ge2obs=int(b["analyzable"].sum()),
             age_mean=b["age"].mean(), pct_female=b["sex_female"].mean() * 100,
             baseline_wt_kg_mean=b["baseline_weight_kg"].mean(),
-            csg7_ever_pct=b["ever_csg7"].mean() * 100,
-            mean_max_pct_gain=b["max_pct_gain"].mean(),
+            csg7_ever_n=int(ba["ever_csg7"].sum()),
+            csg7_ever_pct=ba["ever_csg7"].mean() * 100,
+            mean_max_pct_gain=ba["max_pct_gain"].mean(),
         ))
     desc_class = pd.DataFrame(crows)
     return desc, desc_class
@@ -307,6 +320,11 @@ def catie_olanzapine(long, base):
 def main():
     print("=== Transdiagnostic weight models ===")
     long, base = load()
+    # Primary-analysis cohort: participants with ≥1 post-baseline weight, i.e. for
+    # whom incident ≥7% gain could actually be observed (Reviewer 2, comment 2).
+    base_primary = base[base["analyzable"]].copy() if PRIMARY_REQUIRE_POSTBASELINE else base
+    print(f"  primary cohort (>=1 post-baseline weight): {len(base_primary):,} of {len(base):,} "
+          f"({len(base) - len(base_primary):,} baseline-only excluded)")
 
     print("\n[1] Descriptives")
     desc, desc_class = descriptives(base)
@@ -321,13 +339,13 @@ def main():
     forest = per_study_slopes(long, base)
     print(forest.to_string(index=False))
 
-    print("\n[4] Landmark + logistic")
-    base_lm = landmark_pct(long, base)
+    print("\n[4] Landmark + logistic (primary cohort: >=1 post-baseline weight)")
+    base_lm = landmark_pct(long, base_primary)
     logits = logistic_models(base_lm)
     print(logits["logit_ever_csg7"].to_string(index=False))
 
-    print("\n[5] CATIE olanzapine vs others")
-    catie_by_drug, ola, catie_slope = catie_olanzapine(long, base)
+    print("\n[5] CATIE olanzapine vs others (primary cohort)")
+    catie_by_drug, ola, catie_slope = catie_olanzapine(long, base_primary)
     print(catie_by_drug.to_string(index=False))
     print("  olanzapine OR (ever>=7%):", {k: round(v, 3) if isinstance(v, float) else v for k, v in ola.items()})
 
@@ -351,14 +369,25 @@ def main():
                 dat.to_excel(w, sheet_name=name[:31], index=False)
     (OUT / "mixed_model_summary.txt").write_text(mixed_txt)
 
-    # JSON: scalar stats the paper needs
+    # JSON: scalar stats the paper needs.
+    # Primary ≥7% event rates use the analyzable (≥1 post-baseline) denominator.
+    ana = base[base["analyzable"]]
     summary = {
         "N_total": int(len(base)),
         "N_analyzable_ge2obs": int(base["analyzable"].sum()),
+        "primary_cohort_note": ("Primary cumulative >=7% analysis restricted to "
+                                "participants with >=1 post-baseline weight "
+                                "(Reviewer 2, comment 2)."),
         "by_study_N": base.groupby("study").size().to_dict(),
         "by_class_N": base.groupby("drug_class").size().to_dict(),
+        "by_class_N_analyzable": {
+            c: int(((base["drug_class"] == c) & base["analyzable"]).sum())
+            for c in CLASS_ORDER},
         "csg7_ever_pct_by_class": {
-            c: round(base.loc[base["drug_class"] == c, "ever_csg7"].mean() * 100, 1)
+            c: round(ana.loc[ana["drug_class"] == c, "ever_csg7"].mean() * 100, 1)
+            for c in CLASS_ORDER},
+        "csg7_ever_n_by_class": {
+            c: int(ana.loc[ana["drug_class"] == c, "ever_csg7"].sum())
             for c in CLASS_ORDER},
         "slope_pct_per_month_by_class": {
             r["drug_class"]: round(r["slope_pct_per_month"], 3)
